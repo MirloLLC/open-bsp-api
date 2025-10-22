@@ -1,19 +1,23 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import * as log from "../_shared/logger.ts";
 import {
-  type IncomingMessage,
-  type MessageInsert,
+  type IncomingMessageV1,
+  type OutgoingMessageV1,
+  type MessageInsertV1,
   type ConversationInsert,
-  type MessageUpdate,
-  type OutgoingStatus,
-  type WebhookMessage,
-  type WebhookStatus,
-  type BaseMessage,
+  type MessageInsert,
+  type OutgoingMessage,
+  type MetaWebhookPayload,
+  type WebhookIncomingMessage,
+  type WebhookEchoMessage,
+  type WebhookHistoryMessage,
+  type MessageRow,
   createUnsecureClient,
 } from "../_shared/supabase.ts";
 import { fetchMedia, uploadToStorage } from "../_shared/media.ts";
+import { fromV1 } from "../_shared/messages-v0.ts";
 
-const API_VERSION = "v23.0";
+const API_VERSION = "v24.0";
 const VERIFY_TOKEN = Deno.env.get("WHATSAPP_VERIFY_TOKEN");
 const APP_ID = Deno.env.get("META_APP_ID");
 const APP_SECRET = Deno.env.get("META_APP_SECRET");
@@ -48,517 +52,6 @@ function verifyToken(request: Request): Response {
   return new Response("Verification failed, tokens do not match", {
     status: 403,
   });
-}
-
-async function downloadMediaItem({
-  organization_id,
-  media_id,
-  access_token,
-  messageRecord,
-  client,
-  filename,
-}: {
-  organization_id: string;
-  media_id: string;
-  access_token: string;
-  messageRecord: MessageInsert;
-  client: SupabaseClient;
-  filename?: string;
-}): Promise<MessageInsert> {
-  if (!(messageRecord.message as BaseMessage).media) {
-    throw new Error(
-      `Message with id ${messageRecord.id} is missing the media property.`,
-    );
-  }
-
-  // Fetch part 1: Get the download url using the media id
-  const response = await fetch(
-    `https://graph.facebook.com/${API_VERSION}/${media_id}`,
-    {
-      headers: { Authorization: `Bearer ${access_token}` },
-    },
-  );
-
-  if (!response.ok) {
-    log.error(response.headers.get("www-authenticate")!);
-    throw response;
-  }
-
-  const mediaMetadata = (await response.json()) as {
-    messaging_product: "whatsapp";
-    url: string;
-    mime_type: string;
-    sha256: string;
-    file_size: number;
-    id: string;
-  };
-
-  // Fetch part 2: Get the file using the download url
-  const file = await fetchMedia(mediaMetadata.url, access_token);
-
-  // Store the file
-  const uri = await uploadToStorage(client, organization_id, file, filename);
-
-  (messageRecord.message as BaseMessage).media!.id = uri; // Overwrite WA media id with the internal uri
-  (messageRecord.message as BaseMessage).media!.file_size =
-    mediaMetadata.file_size;
-
-  return messageRecord;
-}
-
-/** Patches messages with media local id and file size
- *
- * @param mediaMessages
- * @returns modified messages
- */
-async function downloadMedia(
-  mediaMessages: MessageInsert[],
-  client: SupabaseClient,
-): Promise<MessageInsert[]> {
-  if (!mediaMessages.length) return [];
-
-  const unique_number_ids = [
-    ...new Set(mediaMessages.map((m) => m.organization_address)),
-  ]; // organization_address is the WA phone_number_id
-
-  const { data: addresses, error: queryError } = await client
-    .from("organizations_addresses")
-    .select("organization_id, address, extra->>access_token")
-    .in("address", unique_number_ids);
-
-  if (queryError) throw queryError;
-
-  addresses.forEach((a) => {
-    a.access_token ||= DEFAULT_ACCESS_TOKEN;
-  });
-
-  const number_ids_to_org_ids: Map<string, string> = new Map(
-    addresses.map((a) => [a.address, a.organization_id]),
-  );
-
-  const number_ids_to_access_tokens: Map<string, string> = new Map(
-    addresses.map((a) => [a.address, a.access_token]),
-  );
-
-  return Promise.all(
-    mediaMessages.map((m) =>
-      downloadMediaItem({
-        organization_id: number_ids_to_org_ids.get(m.organization_address)!,
-        media_id: (m.message as BaseMessage).media!.id,
-        access_token: number_ids_to_access_tokens.get(m.organization_address)!,
-        messageRecord: m,
-        client,
-        filename: (m.message as BaseMessage).media!.filename,
-      }),
-    ),
-  );
-}
-
-/**
- * About the payload error fields madness. We can encounter error messages at
- *   1. value.errors - not totally understand this
- *   2. value.messages[].errors - incoming messages errors such as user sending unsupported message
- *   3. value.statuses[].errors - outgoing messages errors
- */
-async function processMessage(request: Request): Promise<Response> {
-  // Validate that the request comes from Meta
-  const isValidSignature = await validateWebhookSignature(request);
-
-  if (!isValidSignature) {
-    return new Response("Unauthorized: Invalid webhook signature", {
-      status: 401,
-    });
-  }
-
-  const client = createUnsecureClient();
-
-  const payload = await request.json();
-
-  if (payload.object !== "whatsapp_business_account") {
-    return new Response("Unexpected object", { status: 400 });
-  }
-
-  const messages: MessageInsert[] = [];
-  const mediaMessages: MessageInsert[] = [];
-  const contacts: Map<string, string> = new Map(); // key: WA ID, value: name
-  const conversations: Set<ConversationInsert> = new Set();
-  const statuses: MessageUpdate[] = [];
-
-  for (const entry of payload.entry) {
-    const _waba_id = entry.id; // WhatsApp business account ID (WABA ID)
-
-    for (const { value, field } of entry.changes) {
-      log.info("WhatsApp payload", value);
-      const organization_address = value.metadata.phone_number_id; // WhatsApp business account phone number id
-
-      let valueMessages = [];
-
-      if (field === "messages") {
-        valueMessages = value.messages;
-      } else if (field === "smb_message_echoes") {
-        valueMessages = value.message_echoes;
-      }
-
-      if (valueMessages) {
-        for (const message of valueMessages as WebhookMessage[]) {
-          let contact_address = message.from; // Phone number
-
-          if (field === "smb_message_echoes") {
-            contact_address = message.to;
-          }
-
-          switch (message.type) {
-            case "system": {
-              // TODO: it seems that this message can be mark as read
-              // TODO: customer_identity_changed
-              if (message.system.type === "customer_changed_number") {
-                const old_wa_id = message.system!.customer;
-                const new_wa_id = message.system!.wa_id;
-
-                // TODO: outdated
-                const { error } = await client
-                  .from("contacts")
-                  .update({ extra: { whatsapp_id: new_wa_id } })
-                  .eq("organization_address", organization_address)
-                  .eq("extra->>whatsapp_id", old_wa_id);
-
-                if (error) {
-                  log.error(
-                    `Could not update contact with old whatsapp id ${old_wa_id} during contact number update`,
-                    error,
-                  );
-                  continue;
-                }
-              }
-              break;
-            }
-            case "unknown":
-            case "unsupported": {
-              if (message.errors) {
-                for (const error of message.errors) {
-                  log.warn(
-                    `Incoming message error from contact address ${contact_address} to organization address ${organization_address}`,
-                    error.message,
-                  );
-                }
-              }
-              break;
-            }
-            default: {
-              const { id, from, to, timestamp, ...andMore } = message;
-
-              // Message echo is a outgoing message with incoming message payload
-              const inMessage = andMore as IncomingMessage;
-
-              if (message.context?.id) {
-                // "re" stands for refered: a message that is replied, reacted or forwarded.
-                // It references the message WAMID, which is stored in `external_id`.
-                // It is not the same as our internal message `id`!
-                // TODO: I wonder if we should use the `id` field instead (in a reliable way). - cabra 2025/01/29
-                inMessage.re_message_id = message.context.id;
-              }
-
-              if (message.context?.forwarded) {
-                inMessage.forwarded = true;
-                delete inMessage.context?.forwarded;
-              }
-
-              /* Note: We are in the process of moving away from the WhatsApp message types to the more generic BaseMessage type.
-               * Thus, we are deleting the WhatsApp-specific properties from the inMessage object.
-               * Nonetheless, we are storing every other property not present in the BaseMessage type, till the moment we handle them properly.
-               */
-              switch (message.type) {
-                case "text":
-                  inMessage.content = message.text.body;
-                  if ("text" in inMessage) {
-                    delete inMessage.text;
-                  }
-                  break;
-                case "reaction":
-                  inMessage.content = message.reaction.emoji || "";
-                  inMessage.re_message_id = message.reaction.message_id;
-                  if ("reaction" in inMessage) {
-                    delete inMessage.reaction;
-                  }
-                  break;
-                case "button":
-                  // TODO: handle payload
-                  inMessage.content = message.button.text;
-                  break;
-                case "audio":
-                  inMessage.media = message.audio;
-                  if ("audio" in inMessage) {
-                    delete inMessage.audio;
-                  }
-                  break;
-                case "document":
-                  if (message.document.caption) {
-                    inMessage.content = message.document.caption;
-                  }
-                  inMessage.media = message.document;
-                  if ("document" in inMessage) {
-                    delete inMessage.document;
-                  }
-                  break;
-                case "image":
-                  if (message.image.caption) {
-                    inMessage.content = message.image.caption;
-                  }
-                  inMessage.media = message.image;
-                  if ("image" in inMessage) {
-                    delete inMessage.image;
-                  }
-                  break;
-                case "sticker":
-                  inMessage.media = message.sticker;
-                  if ("sticker" in inMessage) {
-                    delete inMessage.sticker;
-                  }
-                  break;
-                case "video":
-                  if (message.video.caption) {
-                    inMessage.content = message.video.caption;
-                  }
-                  inMessage.media = message.video;
-                  if ("video" in inMessage) {
-                    delete inMessage.video;
-                  }
-                  break;
-                case "contacts": {
-                  // TODO: workaround till handled properly in the UI and the bot
-                  const contactsInfo = message.contacts.map((contact) => {
-                    const name = contact.name.formatted_name;
-                    const phones =
-                      contact.phones?.map((p) => p.phone).join(", ") || "";
-                    return name + (phones ? "\n" + phones : "");
-                  });
-
-                  inMessage.content = contactsInfo.join("\n\n");
-                  break;
-                }
-                case "interactive":
-                  // TODO: handle payload
-                  inMessage.content =
-                    "button_reply" in message.interactive
-                      ? message.interactive.button_reply.title
-                      : message.interactive.list_reply.title;
-                  break;
-              }
-
-              const inMessageRecord: MessageInsert = {
-                // id is the internal (aka surrogate) identifier given by the DB, while
-                // external_id is the one given by the service, such as the WhatsApp message id (WAMID)
-                external_id: id,
-                service: "whatsapp",
-                organization_address,
-                contact_address,
-                type: field === "smb_message_echoes" ? "outgoing" : "incoming",
-                direction:
-                  field === "smb_message_echoes" ? "outgoing" : "incoming",
-                message: inMessage,
-                ...(field === "smb_message_echoes"
-                  ? {
-                      status: {
-                        sent: new Date(timestamp * 1000).toISOString(),
-                      },
-                    }
-                  : {}),
-                timestamp: new Date(timestamp * 1000).toISOString(),
-              };
-
-              if (inMessage.media) {
-                mediaMessages.push(inMessageRecord);
-              } else {
-                messages.push(inMessageRecord);
-              }
-
-              conversations.add({
-                service: "whatsapp",
-                organization_address,
-                contact_address,
-              });
-            }
-          }
-        }
-      }
-
-      if (value.contacts) {
-        for (const contact of value.contacts) {
-          contacts.set(contact.wa_id, contact.profile.name);
-        }
-      }
-
-      if (value.errors) {
-        for (const error of value.errors) {
-          log.warn(
-            `WhatsApp error for organization address (phone number id) ${organization_address}`,
-            error.message,
-          );
-        }
-      }
-
-      /**
-       * About the conversations-based pricing madness.
-       * https://developers.facebook.com/docs/whatsapp/pricing
-       *
-       * **
-       * WhatsApp dubs conversations as sessions.
-       * For us conversations mean chats/threads.
-       * For WhatsApp, conversations are 24-hour sessions.
-       * **
-       *
-       * ## Customer Service Windows
-       *
-       * When a customer messages you, a 24-hour timer called a customer service window starts.
-       * If you are within the window, you can send free-form messages or template messages.
-       * If you are outside the window, you can only send template messages.
-       *
-       * ## Conversation Categories
-       *
-       * Marketing, utility, and authentication conversations can only be opened with template messages.
-       * Service conversations can only be opened with free-form messages.
-       *
-       * ## Marketing, Utility, and Authentication Conversations
-       *
-       * When you send an approved marketing, utility, or authentication template
-       * to a customer, we check if an open conversation matching the template's category already exists between you and the customer.
-       * If one exists, no new conversation is opened. If one does not exist, a new conversation of that category is opened, lasting 24 hours.
-       *
-       * ## Service Conversations
-       *
-       * When you send a free-form message to a customer (which can only be done if a customer service window exists between you and the customer),
-       * we check if an open conversation — of any category — already exists between you and the customer.
-       * If one exists, no new conversation is opened. If a conversation does not exist, a new service conversation is opened, lasting 24 hours.
-       *
-       * ## Conversation Duration
-       *
-       * Marketing, utility, authentication, and service conversations last 24 hours unless closed by a newly opened free-entry point conversation.
-       * Free-entry point conversations last 72 hours.
-       *
-       * ## Free Entry Point Conversations
-       *
-       * A free entry point conversation is opened if (1) a customer using a device running Android or iOS
-       * messages you via a Click to WhatsApp Ad or Facebook Page Call-to-Action button and (2) you respond within 24 hours.
-       * If you do not respond within 24 hours, a free entry point conversation is not opened and you must use a template
-       * to message the customer, which opens a marketing, utility, or authentication conversation, per the category of the template.
-       *
-       * The free entry point conversation is opened as soon as your message is delivered and lasts 72 hours.
-       * When a free entry point conversation is opened, it automatically closes all other open conversations between you and the customer,
-       * and no new conversations will be opened until the free entry point conversation expires.
-       *
-       * Once the free entry point conversation is opened, you can send any type of message to the customer without incurring additional charges.
-       * However, you can only send free-form messages if there is an open customer service window between you and the customer.
-       *
-       * ## Free Tier Conversations
-       *
-       * Each WhatsApp Business Account gets 1000 free service conversations each month across all of its business phone numbers.
-       * This number is refreshed at the beginning of each month, based on WhatsApp Business Account time zone.
-       * Marketing, utility and authentication conversations are not part of the free tier.
-       *
-       * ---
-       *
-       * ## Notes
-       *
-       * 1. To track Customer Service Windows in Conversations would be costly, since we should update the expiration datetime each time there is
-       *    an incoming message. Let's just check the last message timestamp at the bot function and the UI.
-       *
-       * 2. Total conversations per billing period = Number of unique conversation IDs associated
-       *    with a WABA ID with status "delivered" or "read" in that billing period.
-       *
-       *    PRE
-       *
-       *    Does the status has an indicator of a new conversation? I think it doesn't.
-       *    Work around: check status.conversation.expiration_timestamp - now >= 86000
-       *    Then update the conversation (ours) with the session category and id.
-       *    Only notifications with status.status = 'sent' have the expiration_timestamp field.
-       *
-       *    POST
-       *
-       *    select count(distinct status->conversation->>id)
-       *    from messages as m
-       *    join organization_addresses as a
-       *    on m.organization_address = a.address
-       *    where m.status->>status = 'delivered' or m.status->>status = 'read'
-       *      and m.service = 'whatsapp'
-       *    group by a.extra->>waba_id, month(m.timestamp, a.extra->>timezone)
-       */
-
-      if (value.statuses) {
-        for (const status of value.statuses as WebhookStatus[]) {
-          const outStatus: OutgoingStatus = {
-            [status.status]: new Date(
-              parseInt(status.timestamp) * 1000,
-            ).toISOString(),
-          };
-
-          if (status.status === "failed") {
-            outStatus.errors = status.errors.map((e) => e.message);
-
-            for (const error of status.errors) {
-              log.error(
-                `WhatsApp status error for outgoing message id ${status.id}`,
-                error.message,
-              );
-            }
-          }
-
-          if (status.status === "sent") {
-            outStatus.conversation = {
-              id: status.conversation.id,
-              type: status.conversation.origin.type,
-              expiration_timestamp: new Date(
-                parseInt(status.conversation.expiration_timestamp) * 1000,
-              ).toISOString(),
-            };
-          }
-
-          statuses.push({
-            external_id: status.id,
-            status: outStatus,
-          });
-        }
-      }
-    }
-  }
-
-  const downloadMediaPromise = downloadMedia(mediaMessages, client);
-
-  // Note: Tried with bulk upsert. It did not work. It expects values in all fields even for update.
-  // Hence, using a custom RCP to perform bulk update.
-  // Note 2: The order of these notifications may not reflect the actual timing of the message status.
-  // Worry not, we took care of it.
-  const statusesPromise = client.rpc("bulk_update_messages_status", {
-    records: statuses,
-  });
-
-  conversations.forEach(
-    (conv) => (conv.name = contacts.get(conv.contact_address!)),
-  );
-
-  const { error: conversationsError } = await client
-    .from("conversations")
-    .insert(Array.from(conversations) as ConversationInsert[]);
-
-  if (conversationsError) throw conversationsError;
-
-  // Download media before upserting incoming messages
-  // Patched messages include media local id and file size
-  const patchedMediaMessages = await downloadMediaPromise;
-
-  const { error: incomingError } = await client
-    .from("messages")
-    .upsert(messages.concat(patchedMediaMessages), {
-      ignoreDuplicates: true,
-      onConflict: "external_id",
-    });
-
-  if (incomingError) throw incomingError;
-
-  const { error: statusesError } = await statusesPromise;
-
-  if (statusesError) throw statusesError;
-
-  return new Response();
 }
 
 /**
@@ -651,4 +144,653 @@ async function validateWebhookSignature(request: Request): Promise<boolean> {
     );
     return false;
   }
+}
+
+async function downloadMediaItem({
+  organization_id,
+  access_token,
+  message,
+  client,
+}: {
+  organization_id: string;
+  access_token: string;
+  message: MessageInsertV1;
+  client: SupabaseClient;
+}): Promise<MessageInsertV1> {
+  if (message.message.type !== "file") {
+    return message;
+  }
+
+  const media_id = message.message.file.uri;
+  const filename = message.message.file.name;
+
+  // Fetch part 1: Get the download url using the media id
+  const response = await fetch(
+    `https://graph.facebook.com/${API_VERSION}/${media_id}`,
+    {
+      headers: { Authorization: `Bearer ${access_token}` },
+    },
+  );
+
+  if (!response.ok) {
+    log.error(response.headers.get("www-authenticate")!);
+    throw response;
+  }
+
+  const mediaMetadata = (await response.json()) as {
+    messaging_product: "whatsapp";
+    url: string;
+    mime_type: string;
+    sha256: string;
+    file_size: number;
+    id: string;
+  };
+
+  // Fetch part 2: Get the file using the download url
+  const file = await fetchMedia(mediaMetadata.url, access_token);
+
+  // Store the file
+  const uri = await uploadToStorage(client, organization_id, file, filename);
+
+  message.message.file.uri = uri; // Overwrite WA media id with the internal uri
+  message.message.file.size = mediaMetadata.file_size;
+
+  return message;
+}
+
+/** Patches messages with media local id and file size
+ *
+ * @param mediaMessages
+ * @returns modified messages
+ */
+async function downloadMedia(
+  mediaMessages: MessageInsertV1[],
+  client: SupabaseClient,
+): Promise<MessageInsertV1[]> {
+  if (!mediaMessages.length) {
+    return [];
+  }
+
+  const unique_number_ids = [
+    ...new Set(mediaMessages.map((m) => m.organization_address)),
+  ]; // organization_address is the WA phone_number_id
+
+  const { data: addresses, error: queryError } = await client
+    .from("organizations_addresses")
+    .select("organization_id, address, extra->>access_token")
+    .in("address", unique_number_ids);
+
+  if (queryError) {
+    throw queryError;
+  }
+
+  addresses.forEach((a) => {
+    a.access_token ||= DEFAULT_ACCESS_TOKEN;
+  });
+
+  const number_ids_to_org_ids: Map<string, string> = new Map(
+    addresses.map((a) => [a.address, a.organization_id]),
+  );
+
+  const number_ids_to_access_tokens: Map<string, string> = new Map(
+    addresses.map((a) => [a.address, a.access_token]),
+  );
+
+  return Promise.all(
+    mediaMessages.map((message) =>
+      downloadMediaItem({
+        organization_id: number_ids_to_org_ids.get(
+          message.organization_address,
+        )!,
+        access_token: number_ids_to_access_tokens.get(
+          message.organization_address,
+        )!,
+        message,
+        client,
+      }),
+    ),
+  );
+}
+
+function webhookMessageToIncomingMessageV1(
+  message: WebhookIncomingMessage | WebhookEchoMessage | WebhookHistoryMessage,
+): IncomingMessageV1 | undefined {
+  let re_message_id: string | undefined;
+  let forwarded: boolean | undefined;
+
+  // Handle context information for incoming messages
+  if ("context" in message && message.context) {
+    if (message.context.id) {
+      re_message_id = message.context.id;
+    }
+    if (message.context.forwarded) {
+      forwarded = true;
+    }
+  }
+
+  // Handle reactions - they reference a message differently
+  if (message.type === "reaction") {
+    re_message_id = message.reaction.message_id;
+  }
+
+  const baseMessage = {
+    version: "1" as const,
+    ...(re_message_id && { re_message_id }),
+    ...(forwarded && { forwarded }),
+  };
+
+  switch (message.type) {
+    case "text": {
+      return {
+        ...baseMessage,
+        type: "text",
+        kind: "text",
+        text: message.text.body,
+      };
+    }
+
+    case "reaction": {
+      return {
+        ...baseMessage,
+        type: "text",
+        kind: "reaction",
+        text: message.reaction.emoji || "",
+      };
+    }
+
+    case "audio": {
+      return {
+        ...baseMessage,
+        type: "file",
+        kind: "audio",
+        file: {
+          mime_type: message.audio.mime_type,
+          uri: message.audio.id, // Will be replaced with internal URI after download
+          size: 0, // Will be updated after download
+        },
+      };
+    }
+
+    case "image": {
+      return {
+        ...baseMessage,
+        type: "file",
+        kind: "image",
+        file: {
+          mime_type: message.image.mime_type,
+          uri: message.image.id, // Will be replaced with internal URI after download
+          size: 0, // Will be updated after download
+        },
+        ...(message.image.caption && { text: message.image.caption }),
+      };
+    }
+
+    case "video": {
+      return {
+        ...baseMessage,
+        type: "file",
+        kind: "video",
+        file: {
+          mime_type: message.video.mime_type,
+          uri: message.video.id, // Will be replaced with internal URI after download
+          name: message.video.filename,
+          size: 0, // Will be updated after download
+        },
+        ...(message.video.caption && { text: message.video.caption }),
+      };
+    }
+
+    case "document": {
+      return {
+        ...baseMessage,
+        type: "file",
+        kind: "document",
+        file: {
+          mime_type: message.document.mime_type,
+          uri: message.document.id, // Will be replaced with internal URI after download
+          name: message.document.filename,
+          size: 0, // Will be updated after download
+        },
+        ...(message.document.caption && { text: message.document.caption }),
+      };
+    }
+
+    case "sticker": {
+      return {
+        ...baseMessage,
+        type: "file",
+        kind: "sticker",
+        file: {
+          mime_type: message.sticker.mime_type,
+          uri: message.sticker.id, // Will be replaced with internal URI after download
+          size: 0, // Will be updated after download
+        },
+      };
+    }
+
+    case "contacts": {
+      return {
+        ...baseMessage,
+        type: "data",
+        kind: "contacts",
+        data: message.contacts,
+      };
+    }
+
+    case "location": {
+      return {
+        ...baseMessage,
+        type: "data",
+        kind: "location",
+        data: message.location,
+      };
+    }
+
+    case "order": {
+      return {
+        ...baseMessage,
+        type: "data",
+        kind: "order",
+        data: message.order,
+      };
+    }
+
+    case "interactive": {
+      return {
+        ...baseMessage,
+        type: "data",
+        kind: "interactive",
+        data: message.interactive,
+      };
+    }
+
+    case "button": {
+      return {
+        ...baseMessage,
+        type: "data",
+        kind: "button",
+        data: message.button,
+      };
+    }
+
+    case "media_placeholder": {
+      return {
+        ...baseMessage,
+        type: "data",
+        kind: "media_placeholder",
+        data: null,
+      };
+    }
+
+    case "system":
+    /*
+    // TODO: it seems that this message can be mark as read
+    // TODO: customer_identity_changed
+    if (message.system.type === "customer_changed_number") {
+      const old_wa_id = message.system!.customer;
+      const new_wa_id = message.system!.wa_id;
+
+      // TODO: outdated
+      const { error } = await client
+        .from("contacts")
+        .update({ extra: { whatsapp_id: new_wa_id } })
+        .eq("organization_address", organization_address)
+        .eq("extra->>whatsapp_id", old_wa_id);
+
+      if (error) {
+        log.error(
+          `Could not update contact with old whatsapp id ${old_wa_id} during contact number update`,
+          error,
+        );
+        continue;
+      }
+    }
+    */
+    case "unsupported":
+    default: {
+      // System and unsupported messages are not converted to IncomingMessageV1
+      // They should be handled separately or filtered out before calling this function
+      log.error(
+        `Message type "${message.type}" cannot be converted to IncomingMessageV1`,
+        message,
+      );
+    }
+  }
+}
+
+async function processMessage(request: Request): Promise<Response> {
+  // Validate that the request comes from Meta
+  const isValidSignature = await validateWebhookSignature(request);
+
+  if (!isValidSignature) {
+    return new Response("Unauthorized: Invalid webhook signature", {
+      status: 401,
+    });
+  }
+
+  const client = createUnsecureClient();
+
+  const payload = (await request.json()) as MetaWebhookPayload;
+
+  if (payload.object !== "whatsapp_business_account") {
+    return new Response("Unexpected object", { status: 400 });
+  }
+
+  const messages: MessageInsertV1[] = [];
+  const conversations: Set<ConversationInsert> = new Set();
+  const statuses: MessageInsert[] = [];
+
+  for (const entry of payload.entry) {
+    const _waba_id = entry.id; // WhatsApp business account ID (WABA ID)
+
+    for (const { value, field } of entry.changes) {
+      log.info(`WhatsApp ${field} payload`, value);
+      const organization_address = value.metadata.phone_number_id; // WhatsApp business account phone number id
+
+      if (field === "messages" && "contacts" in value) {
+        for (const contact of value.contacts) {
+          conversations.add({
+            service: "whatsapp",
+            organization_address,
+            contact_address: contact.wa_id,
+            name: contact.profile.name,
+          });
+        }
+      }
+
+      if (field === "messages" && "messages" in value) {
+        for (const webhookMessage of value.messages) {
+          const contact_address = webhookMessage.from;
+          const content = webhookMessageToIncomingMessageV1(webhookMessage);
+
+          if (!content) {
+            continue;
+          }
+
+          const message = {
+            // id is the internal (aka surrogate) identifier given by the DB, while
+            // external_id is the one given by the service, such as the WhatsApp message id (WAMID)
+            external_id: webhookMessage.id,
+            service: "whatsapp" as const,
+            organization_address,
+            contact_address,
+            type: "incoming" as const, // TODO: deprecate with v0
+            direction: "incoming" as const,
+            message: content,
+            timestamp: new Date(webhookMessage.timestamp * 1000).toISOString(),
+          };
+
+          messages.push(message);
+        }
+      }
+
+      if (field === "messages" && "statuses" in value) {
+        for (const status of value.statuses) {
+          statuses.push({
+            external_id: status.id,
+            service: "whatsapp",
+            organization_address,
+            contact_address: status.recipient_id,
+            type: "outgoing",
+            direction: "outgoing",
+            message: {} as OutgoingMessage, // this will get merged (it won't overwrite)
+            status: {
+              [status.status]: new Date(
+                parseInt(status.timestamp) * 1000,
+              ).toISOString(),
+              errors: status.errors,
+            },
+          });
+        }
+      }
+
+      if (field === "messages" && "errors" in value) {
+        for (const error of value.errors) {
+          log.error(
+            `WhatsApp error for organization address (phone number id) ${organization_address}`,
+            error,
+          );
+
+          client
+            .from("organizations_addresses")
+            .update({
+              extra: {
+                logs: [
+                  {
+                    webhook: "messages",
+                    timestamp: new Date().toISOString(),
+                    level: "error",
+                    message: error,
+                  },
+                ],
+              },
+            })
+            .eq("address", organization_address);
+        }
+      }
+
+      if (field === "smb_message_echoes") {
+        for (const webhookMessage of value.message_echoes) {
+          const contact_address = webhookMessage.to;
+
+          conversations.add({
+            service: "whatsapp",
+            organization_address,
+            contact_address,
+          });
+
+          const content = webhookMessageToIncomingMessageV1(webhookMessage);
+
+          if (!content) {
+            continue;
+          }
+
+          const message = {
+            // id is the internal (aka surrogate) identifier given by the DB, while
+            // external_id is the one given by the service, such as the WhatsApp message id (WAMID)
+            external_id: webhookMessage.id,
+            service: "whatsapp" as const,
+            organization_address,
+            contact_address,
+            type: "outgoing" as const, // TODO: deprecate with v0
+            direction: "outgoing" as const,
+            message: content as OutgoingMessageV1, // Incoming are a superset of outgoing, except for templates
+            status: {
+              sent: new Date(webhookMessage.timestamp * 1000).toISOString(),
+            },
+            timestamp: new Date(webhookMessage.timestamp * 1000).toISOString(),
+          };
+
+          messages.push(message);
+        }
+      }
+
+      if (field === "history") {
+        for (const history of value.history) {
+          if ("threads" in history) {
+            // fire and forget
+            client
+              .from("organizations_addresses")
+              .update({
+                extra: {
+                  logs: [
+                    {
+                      webhook: "history",
+                      timestamp: new Date().toISOString(),
+                      level: "info",
+                      message: history.metadata,
+                    },
+                  ],
+                },
+              })
+              .eq("address", organization_address);
+
+            for (const thread of history.threads) {
+              conversations.add({
+                service: "whatsapp",
+                organization_address,
+                contact_address: thread.id,
+              });
+
+              for (const webhookMessage of thread.messages) {
+                const isEcho = "to" in webhookMessage;
+
+                const contact_address = isEcho
+                  ? webhookMessage.to!
+                  : webhookMessage.from;
+
+                const content =
+                  webhookMessageToIncomingMessageV1(webhookMessage);
+
+                if (!content) {
+                  continue;
+                }
+
+                const historyStatusMap = {
+                  READ: "read",
+                  DELIVERED: "delivered",
+                  SENT: "sent",
+                  ERROR: "failed",
+                  PLAYED: "read",
+                  PENDING: "pending",
+                };
+
+                const message = isEcho
+                  ? {
+                      // id is the internal (aka surrogate) identifier given by the DB, while
+                      // external_id is the one given by the service, such as the WhatsApp message id (WAMID)
+                      external_id: webhookMessage.id,
+                      service: "whatsapp" as const,
+                      organization_address,
+                      contact_address,
+                      type: "outgoing" as const, // TODO: deprecate with v0
+                      direction: "outgoing" as const,
+                      message: content as OutgoingMessageV1, // Incoming are a superset of outgoing, except for templates
+                      status: {
+                        [historyStatusMap[
+                          webhookMessage.history_context.status
+                        ]]: new Date(
+                          webhookMessage.timestamp * 1000,
+                        ).toISOString(),
+                      },
+                      timestamp: new Date(
+                        webhookMessage.timestamp * 1000,
+                      ).toISOString(),
+                    }
+                  : {
+                      // id is the internal (aka surrogate) identifier given by the DB, while
+                      // external_id is the one given by the service, such as the WhatsApp message id (WAMID)
+                      external_id: webhookMessage.id,
+                      service: "whatsapp" as const,
+                      organization_address,
+                      contact_address,
+                      type: "incoming" as const, // TODO: deprecate with v0
+                      direction: "incoming" as const,
+                      message: content, // Incoming are a superset of outgoing, except for templates
+                      status: {
+                        [historyStatusMap[
+                          webhookMessage.history_context.status
+                        ]]: new Date(
+                          webhookMessage.timestamp * 1000,
+                        ).toISOString(),
+                      },
+                      timestamp: new Date(
+                        webhookMessage.timestamp * 1000,
+                      ).toISOString(),
+                    };
+
+                messages.push(message);
+              }
+            }
+          }
+
+          if ("errors" in history) {
+            for (const error of history.errors) {
+              client
+                .from("organizations_addresses")
+                .update({
+                  extra: {
+                    logs: [
+                      {
+                        webhook: "history",
+                        timestamp: new Date().toISOString(),
+                        level: "error",
+                        message: error,
+                      },
+                    ],
+                  },
+                })
+                .eq("address", organization_address);
+            }
+          }
+        }
+      }
+
+      if (field === "smb_app_state_sync") {
+        for (const syncItem of value.state_sync) {
+          if (syncItem.type === "contact" && syncItem.action === "add") {
+            conversations.add({
+              service: "whatsapp",
+              organization_address,
+              contact_address: syncItem.contact.phone_number,
+              name: syncItem.contact.full_name,
+              extra: {
+                smb_contact: true,
+              },
+            });
+          }
+        }
+      }
+    }
+  }
+
+  const downloadMediaPromise = downloadMedia(messages, client);
+
+  // Notes:
+  // 1. Upsert is needed because there is no bulk update
+  // 2. Insert operation is not expected, statuses come
+  //    after outgoing messages are inserted
+  // 3. Only the status field should be updated based on external_id,
+  //    but upsert requires records to be prepared for insertion (which won't happen)
+  // 4. message field is present at {}, it will be merged during update (inocuous)
+  const { error: statusesError } = await client
+    .from("messages")
+    .upsert(statuses, {
+      onConflict: "external_id",
+    });
+
+  if (statusesError) {
+    throw statusesError;
+  }
+
+  // Conversations table has a before insert trigger which acts as an upsert.
+  // It won't create a new conversation if an active one exists.
+  // It updates the name if provided.
+  const { error: conversationsError } = await client
+    .from("conversations")
+    .insert(Array.from(conversations));
+
+  if (conversationsError) {
+    throw conversationsError;
+  }
+
+  // Download media before upserting incoming messages
+  // Patched messages include media local id and file size
+  const patchedMessages = await downloadMediaPromise;
+
+  const messagesV0 = patchedMessages
+    .map(fromV1)
+    .filter(Boolean) as MessageRow[];
+
+  const { error: messagesError } = await client
+    .from("messages")
+    .upsert(messagesV0, {
+      onConflict: "external_id",
+    });
+
+  if (messagesError) {
+    throw messagesError;
+  }
+
+  return new Response();
 }

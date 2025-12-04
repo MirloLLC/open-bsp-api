@@ -31,7 +31,6 @@ export type WebhookPayload<Record> = {
  * - Incoming message errors appear in the messages array (entry.changes.value.messages[].errors). These webhooks have type set to unsupported. See the unsupported reference.
  * - Outgoing message errors appear in the statuses array (entry.changes.value.statuses[].errors). See the status reference.
  * - History error, when history is declined (entry.changes.value.history[].errors).
- *
  */
 
 // Base metadata that appears in all webhook values
@@ -42,7 +41,7 @@ export type WebhookMetadata = {
 
 // Contact profile information
 export type WebhookContact = {
-  profile: {
+  profile?: {
     name: string;
   };
   wa_id: string;
@@ -53,7 +52,7 @@ export type WebhookIncomingMessage = WebhookMessageBase & IncomingContextInfo;
 
 export type WebhookValueMessages = {
   messaging_product: "whatsapp";
-  metadata: WebhookMetadata;
+  metadata?: WebhookMetadata;
   contacts: WebhookContact[];
   messages: WebhookIncomingMessage[];
 };
@@ -153,27 +152,62 @@ export type WebhookValueStateSync = {
   state_sync: WebhookStateSyncItem[];
 };
 
+// Account update webhook types
+export type WebhookAccountUpdate_Account = {
+  event: "ACCOUNT_DELETED";
+  waba_info: {
+    waba_id: string;
+    owner_business_id: string;
+  };
+};
+
+export type WebhookAccountUpdate_PartnerApp = {
+  event: "PARTNER_APP_INSTALLED" | "PARTNER_APP_UNINSTALLED";
+  waba_info: {
+    waba_id: string;
+    owner_business_id: string;
+    partner_app_id: string;
+  };
+};
+
+export type WebhookAccountUpdate_Partner = {
+  event: "PARTNER_ADDED" | "PARTNER_REMOVED";
+  waba_info: {
+    waba_id: string;
+    owner_business_id: string;
+  };
+};
+
+export type WebhookAccountUpdateValue =
+  | WebhookAccountUpdate_Account
+  | WebhookAccountUpdate_PartnerApp
+  | WebhookAccountUpdate_Partner;
+
 // Change object that discriminates based on field value
 export type WebhookChange =
   | {
-      field: "messages";
-      value:
-        | WebhookValueMessages // incoming
-        | WebhookValueStatuses // outgoing
-        | WebhookValueMessagesError; // error
-    }
+    field: "messages";
+    value:
+      | WebhookValueMessages // incoming
+      | WebhookValueStatuses // outgoing
+      | WebhookValueMessagesError; // error
+  }
   | {
-      field: "smb_message_echoes";
-      value: WebhookValueMessageEchoes; // outgoing messages from connected devices
-    }
+    field: "smb_message_echoes";
+    value: WebhookValueMessageEchoes; // outgoing messages from connected devices
+  }
   | {
-      field: "history";
-      value: WebhookValueHistory | WebhookValueHistoryError; // when history is declined
-    }
+    field: "history";
+    value: WebhookValueHistory | WebhookValueHistoryError; // when history is declined
+  }
   | {
-      field: "smb_app_state_sync";
-      value: WebhookValueStateSync; // contact sync events
-    };
+    field: "smb_app_state_sync";
+    value: WebhookValueStateSync; // contact sync events
+  }
+  | {
+    field: "account_update";
+    value: WebhookAccountUpdateValue;
+  };
 
 // Entry object that contains one or more changes
 export type WebhookEntry = {
@@ -195,22 +229,23 @@ export type MetaWebhookPayload = {
 export type SystemMessage = {
   type: "system";
   system: {
-    body: string; // Describes the change to the customer's identity or phone number.
-    customer: string; // The WhatsApp ID for the customer prior to the update.
-    identity: string; // Hash for the identity fetched from server.
-    type: "customer_changed_number" | "customer_identity_changed";
-    wa_id: string; // New WhatsApp ID for the customer when their phone number is updated. Available on webhook versions v12.0 and later.
-  };
-  identity?: {
-    acknowledged: boolean; // State of acknowledgment for the messages system customer_identity_changed.
-    created_timestamp: string; // The time when the WhatsApp Business Management API detected the customer may have changed their profile information.
-    hash: string; // The ID for the messages system customer_identity_changed
+    body: string; // Describes the change to the user's phone number.
+    type: "user_changed_number";
+    wa_id: string; // New WhatsApp ID for the user when their phone number is updated.
   };
 };
 
 export type UnsupportedMessage = {
   type: "unsupported";
   errors: Omit<WebhookError, "href">[];
+  unsupported: {
+    type: "edit" | "poll" | "button";
+  };
+};
+
+export type ErrorsMessage = {
+  errors: Omit<WebhookError, "href">[];
+  type: "errors";
 };
 
 // Shared types
@@ -240,24 +275,26 @@ export type IncomingContextInfo = {
  * - sticker
  */
 export type ReferralInfo = {
-  referral?: {
-    source_url: string;
-    source_type: "ad" | "post";
-    source_id: string;
-    headline: string;
-    body: string;
-    ctwa_clid: string;
-  } & (
-    | {
+  referral?:
+    & {
+      source_url: string;
+      source_type: "ad" | "post";
+      source_id: string;
+      headline: string;
+      body: string;
+      ctwa_clid: string;
+    }
+    & (
+      | {
         media_type: "image";
         image_url: string;
       }
-    | {
+      | {
         media_type: "video";
         video_url: string;
         thumbnail_url?: string;
       }
-  );
+    );
 };
 
 // Text based
@@ -362,9 +399,9 @@ export type InteractiveMessage = {
   interactive:
     | { type: "button_reply"; button_reply: { id: string; title: string } }
     | {
-        type: "list_reply";
-        list_reply: { id: string; title: string; description?: string };
-      };
+      type: "list_reply";
+      list_reply: { id: string; title: string; description?: string };
+    };
 };
 
 // ORDER
@@ -429,99 +466,34 @@ export type HistoryContext = {
   status: WebhookStatus["status"];
 };
 
-export type WebhookMessageBase = {
-  from: string;
-  group_id?: string;
-  id: string;
-  timestamp: number;
-} & (
-  | AudioMessage
-  | ButtonMessage
-  | ContactsMessage
-  | DocumentMessage
-  | ImageMessage
-  | InteractiveMessage
-  | LocationMessage
-  | OrderMessage
-  | ReactionMessage
-  | StickerMessage
-  | SystemMessage
-  | TextMessage
-  | UnsupportedMessage
-  | VideoMessage
-  | MediaPlaceholder
-);
-
-//===================================
-// Incoming Message v0, as stored in the database
-//===================================
-
-export type BaseMessage = {
-  content?: string;
-  re_message_id?: string; // replied, reacted or forwarded message id
-  forwarded?: boolean;
-  // TODO: draft?: { approved_by_agent_id: string };
-  media?: {
+export type WebhookMessageBase =
+  & {
+    from: string;
+    group_id?: string;
     id: string;
-    mime_type: string;
-    file_size?: number;
-    filename?: string;
-    voice?: boolean; // used to distinguish voice messages from other audios
-    animated?: boolean; // used to distinguish animated stickers from static stickers
-    annotation?: string; // image and video transcription
-    description?: string; // image and video description
-    url?: string; // WhatsApp can attach media from a URL
-  };
-  artifacts?: Part[];
-};
-
-export type IncomingMessage = { version?: "0" } & BaseMessage &
-  IncomingContextInfo &
-  TaskInfo &
-  (
-    | Omit<AudioMessage, "audio">
+    timestamp: number;
+  }
+  & (
+    | AudioMessage
     | ButtonMessage
     | ContactsMessage
-    | Omit<DocumentMessage, "document">
-    | Omit<ImageMessage, "image">
+    | DocumentMessage
+    | ErrorsMessage
+    | ImageMessage
     | InteractiveMessage
     | LocationMessage
     | OrderMessage
-    | Omit<ReactionMessage, "reaction">
-    | Omit<StickerMessage, "sticker">
-    | Omit<TextMessage, "text">
-    | Omit<VideoMessage, "video">
+    | ReactionMessage
+    | StickerMessage
+    | SystemMessage
+    | TextMessage
+    | UnsupportedMessage
+    | VideoMessage
     | MediaPlaceholder
   );
 
 //===================================
-// Function Messages v0
-//===================================
-
-export type FunctionCallMessage = {
-  type: "function";
-  v1_type: "text" | "data"; // hack for v0 to v1 compatibility
-  id: string;
-  function: {
-    arguments: string;
-    name: string;
-  };
-  artifacts?: Part[];
-} & TaskInfo &
-  ToolInfo;
-
-export type FunctionResponseMessage = {
-  type: "text";
-  v1_type: "text" | "data"; // hack for v0 to v1 compatibility
-  content: string;
-  tool_call_id: string;
-  tool_name?: string;
-  artifacts?: Part[];
-} & TaskInfo &
-  ToolInfo;
-
-//===================================
-// Outgoing Message v0, as stored in the database
+// Outgoing message, as stored in the database
 //===================================
 
 export type OutgoingContextInfo = {
@@ -630,25 +602,27 @@ type TemplateBody = {
   parameters?: TemplateParameter[];
 };
 
-type TemplateButton = {
-  type: "button";
-  index: string; // 0-9
-} & (
-  | {
+type TemplateButton =
+  & {
+    type: "button";
+    index: string; // 0-9
+  }
+  & (
+    | {
       sub_type: "quick_reply";
       parameters: {
         type: "payload";
         payload: string;
       }[];
     }
-  | {
+    | {
       sub_type: "url";
       parameters: {
         type: "url";
         text: string;
       }[];
     }
-);
+  );
 
 export type Template = {
   components?: (TemplateHeader | TemplateBody | TemplateButton)[];
@@ -665,22 +639,6 @@ export type TemplateMessage = {
 };
 
 // TODO: InteractiveMessage
-
-export type OutgoingMessage = { version?: "0" } & BaseMessage &
-  OutgoingContextInfo &
-  TaskInfo &
-  (
-    | Omit<AudioMessage, "audio">
-    | ContactsMessage
-    | Omit<DocumentMessage, "document">
-    | Omit<ImageMessage, "image">
-    | LocationMessage
-    | Omit<ReactionMessage, "reaction">
-    | Omit<StickerMessage, "sticker">
-    | TemplateMessage
-    | Omit<TextMessage, "text">
-    | Omit<VideoMessage, "video">
-  );
 
 //===================================
 // Agent Protocol Types
@@ -699,8 +657,9 @@ export type TaskInfo = {
 };
 
 export type ToolInfo = {
-  tool?: ToolEventInfo &
-    (LocalToolInfo | GoogleToolInfo | OpenAIToolInfo | AnthropicToolInfo);
+  tool?:
+    & ToolEventInfo
+    & (LocalToolInfo | GoogleToolInfo | OpenAIToolInfo | AnthropicToolInfo);
 };
 
 export type ToolEventInfo =
@@ -812,7 +771,15 @@ type ButtonPart = DataPart<"button", ButtonMessage["button"]>;
 
 type TemplatePart = DataPart<"template", Template>;
 
-type MediaPlaceholderPart = DataPart<"media_placeholder", null>;
+type MediaPlaceholderPart = DataPart<
+  "media_placeholder",
+  Record<PropertyKey, never>
+>;
+
+type UnsupportedPart = DataPart<
+  "unsupported",
+  UnsupportedMessage["unsupported"]
+>;
 
 // Multi-part messages
 
@@ -837,12 +804,14 @@ export type Parts = {
  * Excepting Reaction, Contacts and Location, all other types differ depending on the direction (incoming or outgoing)
  */
 
-export type IncomingMessageV1 = {
-  version: "1";
-  re_message_id?: string; // replied, reacted or forwarded message id
-  forwarded?: boolean;
-} & TaskInfo &
-  (
+export type IncomingMessage =
+  & {
+    version: "1";
+    re_message_id?: string; // replied, reacted or forwarded message id
+    forwarded?: boolean;
+  }
+  & TaskInfo
+  & (
     | TextPart
     | FilePart
     | ContactsPart
@@ -851,25 +820,30 @@ export type IncomingMessageV1 = {
     | InteractivePart
     | ButtonPart
     | MediaPlaceholderPart
+    | UnsupportedPart
   );
 
-export type InternalMessageV1 = {
-  version: "1";
-  re_message_id?: string; // replied, reacted or forwarded message id
-  forwarded?: boolean;
-} & TaskInfo &
-  ToolInfo &
-  Part;
+export type InternalMessage =
+  & {
+    version: "1";
+    re_message_id?: string; // replied, reacted or forwarded message id
+    forwarded?: boolean;
+  }
+  & TaskInfo
+  & ToolInfo
+  & Part;
 
-export type OutgoingMessageV1 = {
-  version: "1";
-  re_message_id?: string; // replied, reacted or forwarded message id
-  forwarded?: boolean;
-} & TaskInfo &
-  (TextPart | FilePart | ContactsPart | LocationPart | TemplatePart);
+export type OutgoingMessage =
+  & {
+    version: "1";
+    re_message_id?: string; // replied, reacted or forwarded message id
+    forwarded?: boolean;
+  }
+  & TaskInfo
+  & (TextPart | FilePart | ContactsPart | LocationPart | TemplatePart);
 
 //===================================
-// Endpoint Message v0, as sent to the WhatsApp endpoint
+// Endpoint message, as sent to the WhatsApp endpoint
 //===================================
 
 // Text based
@@ -922,13 +896,15 @@ export type OutgoingSticker = {
 
 // Message format sent to the WhatsApp endpoint
 // https://developers.facebook.com/docs/whatsapp/cloud-api/reference/messages
-export type EndpointMessage = {
-  biz_opaque_callback_data?: string;
-  messaging_product: "whatsapp";
-  recipient_type?: "individual";
-  to: string;
-} & OutgoingContextInfo &
-  (
+export type EndpointMessage =
+  & {
+    biz_opaque_callback_data?: string;
+    messaging_product: "whatsapp";
+    recipient_type?: "individual";
+    to: string;
+  }
+  & OutgoingContextInfo
+  & (
     | OutgoingAudio
     | ContactsMessage
     | OutgoingDocument
@@ -940,6 +916,23 @@ export type EndpointMessage = {
     | OutgoingText
     | OutgoingVideo
   );
+
+export type EndpointMessageResponse = {
+  messaging_product: "whatsapp";
+  contacts: [
+    {
+      input: string;
+      wa_id: string;
+    },
+  ];
+  messages: [
+    {
+      id: string;
+      group_id?: string;
+      message_status?: "accepted" | "held_for_quality_assessment";
+    },
+  ];
+};
 
 //===================================
 // Statuses
@@ -1013,6 +1006,10 @@ export type EndpointStatus = {
   };
 };
 
+export type EndpointStatusResponse = {
+  success: true;
+};
+
 //===================================
 // Extra
 //===================================
@@ -1038,13 +1035,21 @@ export type OrganizationExtra = {
   error_messages_direction?: "internal" | "outgoing";
 };
 
+export type OrganizationAddressExtra = {
+  waba_id?: string;
+  phone_number?: string;
+  verified_name?: string;
+  access_token?: string;
+  flow_type?: "only_waba" | "new_phone_number" | "existing_phone_number";
+};
+
 export type ConversationExtra = {
   type?: "personal" | "group" | "test" | "test_run";
   memory?: Memory;
   paused?: string;
   archived?: string;
   pinned?: string;
-  notifications?: "off" | "muted" | "on";
+  /*
   test_run?: {
     reference_conversation: {
       organization_address: string;
@@ -1053,6 +1058,7 @@ export type ConversationExtra = {
     status?: "fail" | "success";
     reference_message_id?: string;
   };
+  */
 };
 
 export type ContactExtra = {
@@ -1128,16 +1134,6 @@ export type AgentExtra = {
   instructions?: string;
   send_inline_files_up_to_size_mb?: number;
   tools?: ToolConfig[];
-  toolkits?: {
-    name: string;
-    tools: {
-      name: string;
-      [key: string]: any;
-    }[];
-  }[]; // TODO: Deprecate in favour of tools
-  role?: string; // TODO: Deprecate in favour of description
-  prompt?: string; // TODO: Deprecate in favour of instructions
-  provider?: string; // TODO: Deprecate in favour of api_url
 };
 
 export type Database = MergeDeep<
@@ -1148,6 +1144,11 @@ export type Database = MergeDeep<
         organizations: {
           Row: {
             extra: OrganizationExtra | null;
+          };
+        };
+        organizations_addresses: {
+          Row: {
+            extra: OrganizationAddressExtra | null;
           };
         };
         conversations: {
@@ -1161,79 +1162,42 @@ export type Database = MergeDeep<
         messages: {
           Row:
             | {
-                direction: "incoming" | "internal";
-                type: "incoming" | "internal";
-                message: IncomingMessage; // TODO: | IncomingMessageV1;
-                status: IncomingStatus;
-              }
+              direction: "incoming";
+              content: IncomingMessage;
+              status: IncomingStatus;
+            }
             | {
-                direction: "outgoing" | "internal";
-                type: "outgoing" | "draft";
-                message: OutgoingMessage; // TODO: | OutgoingMessageV1;
-                status: OutgoingStatus;
-              }
+              direction: "internal";
+              content: InternalMessage;
+              status: IncomingStatus;
+            }
             | {
-                direction: "internal";
-                type: "function_call"; // TODO: deprecate
-                message: FunctionCallMessage;
-                status: IncomingStatus;
-              }
-            | {
-                direction: "internal";
-                type: "function_response"; // TODO: deprecate
-                message: FunctionResponseMessage;
-                status: IncomingStatus;
-              };
+              direction: "outgoing";
+              content: OutgoingMessage;
+              status: OutgoingStatus;
+            };
           Insert:
             | {
-                organization_id?: string;
-                conversation_id?: string;
-                type: "incoming" | "internal";
-                message: IncomingMessage;
-                status?: IncomingStatus;
-              }
+              organization_id?: string;
+              conversation_id?: string;
+              direction: "incoming";
+              content: IncomingMessage;
+              status?: IncomingStatus;
+            }
             | {
-                organization_id?: string;
-                conversation_id?: string;
-                type: "outgoing" | "draft";
-                message: OutgoingMessage | IncomingMessage;
-                status?: OutgoingStatus;
-              }
+              organization_id?: string;
+              conversation_id?: string;
+              direction: "internal";
+              content: InternalMessage;
+              status?: IncomingStatus;
+            }
             | {
-                organization_id?: string;
-                conversation_id?: string;
-                type: "function_call"; // TODO: deprecate
-                message: FunctionCallMessage;
-                status?: IncomingStatus;
-              }
-            | {
-                organization_id?: string;
-                conversation_id?: string;
-                type: "function_response"; // TODO: deprecate
-                message: FunctionResponseMessage;
-                status?: IncomingStatus;
-              };
-          Update:
-            | {
-                type?: "incoming" | "internal";
-                message?: IncomingMessage;
-                status?: IncomingStatus;
-              }
-            | {
-                type?: "outgoing" | "draft";
-                message?: OutgoingMessage;
-                status?: OutgoingStatus;
-              }
-            | {
-                type?: "function_call"; // TODO: deprecate
-                message?: FunctionCallMessage;
-                status?: IncomingStatus;
-              }
-            | {
-                type?: "function_response"; // TODO: deprecate
-                message?: FunctionResponseMessage;
-                status?: IncomingStatus;
-              };
+              organization_id?: string;
+              conversation_id?: string;
+              direction: "outgoing";
+              content: OutgoingMessage;
+              status?: OutgoingStatus;
+            };
         };
         contacts: {
           Row: {
@@ -1245,80 +1209,15 @@ export type Database = MergeDeep<
             extra: AgentExtra | null;
           };
         };
-      };
-    };
-  }
->;
-
-export type DatabaseV1 = MergeDeep<
-  DatabaseGenerated,
-  {
-    public: {
-      Tables: {
-        messages: {
-          Row:
-            | {
-                direction: "incoming";
-                type: "incoming";
-                message: IncomingMessageV1;
-                status: IncomingStatus;
-              }
-            | {
-                direction: "internal";
-                type:
-                  | "internal"
-                  | "draft"
-                  | "function_response"
-                  | "function_call";
-                message: InternalMessageV1;
-                status: IncomingStatus;
-              }
-            | {
-                direction: "outgoing";
-                type: "outgoing";
-                message: OutgoingMessageV1;
-                status: OutgoingStatus;
-              };
-          Insert:
-            | {
-                organization_id?: string;
-                conversation_id?: string;
-                direction: "incoming";
-                type: "incoming";
-                message: IncomingMessageV1;
-                status?: IncomingStatus;
-              }
-            | {
-                organization_id?: string;
-                conversation_id?: string;
-                direction: "internal";
-                type:
-                  | "internal"
-                  | "draft"
-                  | "function_response"
-                  | "function_call";
-                message: InternalMessageV1;
-                status?: IncomingStatus;
-              }
-            | {
-                organization_id?: string;
-                conversation_id?: string;
-                direction: "outgoing";
-                type: "outgoing";
-                message: OutgoingMessageV1;
-                status?: OutgoingStatus;
-              };
+        logs: {
+          Insert: {
+            organization_id?: string;
+          };
         };
       };
     };
   }
 >;
-
-export type MessageRowV1 = DatabaseV1["public"]["Tables"]["messages"]["Row"];
-export type MessageInsertV1 =
-  DatabaseV1["public"]["Tables"]["messages"]["Insert"];
-export type MessageUpdateV1 =
-  DatabaseV1["public"]["Tables"]["messages"]["Update"];
 
 export type MessageRow = Database["public"]["Tables"]["messages"]["Row"];
 export type MessageInsert = Database["public"]["Tables"]["messages"]["Insert"];
@@ -1333,6 +1232,7 @@ export type OrganizationRow =
   Database["public"]["Tables"]["organizations"]["Row"];
 
 export type ContactRow = Database["public"]["Tables"]["contacts"]["Row"];
+export type ContactInsert = Database["public"]["Tables"]["contacts"]["Insert"];
 
 export type AgentRow = Database["public"]["Tables"]["agents"]["Row"];
 

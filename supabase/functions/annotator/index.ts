@@ -1,19 +1,17 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import {
-  createClient,
-  Part,
+  createUnsecureClient,
   type MessageRow,
+  type Part,
   type WebhookPayload,
 } from "../_shared/supabase.ts";
 import {
   type ApiError,
   type GenerateContentResponse,
   GoogleGenAI,
-  Type,
 } from "@google/genai";
 import { downloadFromStorage, uploadToStorage } from "../_shared/media.ts";
 import { encodeBase64 } from "jsr:@std/encoding/base64";
-import { fromV1, toV1 } from "../_shared/messages-v0.ts";
 import * as log from "../_shared/logger.ts";
 import { stringify } from "jsr:@std/csv/stringify";
 
@@ -66,10 +64,10 @@ Deno.serve(async (req) => {
   const token = authHeader?.replace("Bearer ", "");
 
   if (token !== SERVICE_ROLE_KEY) {
-    //return new Response("Unauthorized", { status: 401 });
+    return new Response("Unauthorized", { status: 401 });
   }
 
-  const client = createClient(req);
+  const client = createUnsecureClient();
 
   const incoming = ((await req.json()) as WebhookPayload<MessageRow>).record!;
 
@@ -79,27 +77,21 @@ Deno.serve(async (req) => {
   ) => {
     log[logLevel](logMessage);
 
-    const { error: annotatedError } = await client
+    await client
       .from("messages")
       .update({ status: { annotated: new Date().toISOString() } })
-      .eq("id", incoming.id);
-
-    if (annotatedError) {
-      throw annotatedError;
-    }
+      .eq("id", incoming.id)
+      .throwOnError();
 
     return new Response();
   };
 
-  const { data: conv, error: convError } = await client
+  const { data: conv } = await client
     .from("conversations")
     .select(`*, organizations (*)`)
     .eq("id", incoming.conversation_id)
-    .single();
-
-  if (convError) {
-    throw convError;
-  }
+    .single()
+    .throwOnError();
 
   const org = conv.organizations;
 
@@ -124,10 +116,7 @@ Deno.serve(async (req) => {
 
   const language = config.language || "English";
 
-  const apiKey =
-    config.api_key ||
-    Deno.env.get("GOOGLE_API_KEY") ||
-    Deno.env.get("GEMINI_API_KEY");
+  const apiKey = config.api_key || Deno.env.get("GEMINI_API_KEY");
 
   if (!apiKey) {
     return log_update_and_respond(
@@ -140,26 +129,17 @@ Deno.serve(async (req) => {
     apiKey,
   });
 
-  const row_v1 = toV1(incoming);
+  const { content, status } = incoming;
 
-  if (!row_v1) {
-    return log_update_and_respond(
-      "error",
-      "Failed to convert incoming message row from v0 to v1. Skipping annotation.",
-    );
-  }
-
-  const { message, status } = row_v1;
-
-  if (message.type !== "file") {
+  if (content.type !== "file") {
     return log_update_and_respond(
       "error",
       "Incoming message is not a file. Skipping annotation.",
     );
   }
 
-  const mimeType = message.file.mime_type;
-  const mediaType = message.kind === "sticker" ? "image" : message.kind;
+  const mimeType = content.file.mime_type;
+  const mediaType = content.kind === "sticker" ? "image" : content.kind;
 
   const allowedMimeTypes: Record<string, string[]> = {
     audio: [
@@ -207,8 +187,7 @@ Deno.serve(async (req) => {
     ],
   };
 
-  const isSupportedMimeType =
-    mimeType.startsWith("text/") ||
+  const isSupportedMimeType = mimeType.startsWith("text/") ||
     allowedMimeTypes[mediaType]?.includes(mimeType.split(";")[0]); // "audio/ogg; codecs=opus" -> "audio/ogg"
 
   if (!isSupportedMimeType) {
@@ -221,7 +200,7 @@ Deno.serve(async (req) => {
   // Check if we need to use File API vs inline data. Max payload size is 20MB.
   // Use 19MB limit to leave space for prompt and other request data.
   // We multiply by 1.33 to account for the base64 encoding overhead.
-  const shouldUseFileAPI = message.file.size * 1.33 > INLINE_DATA_SIZE_LIMIT;
+  const shouldUseFileAPI = content.file.size * 1.33 > INLINE_DATA_SIZE_LIMIT;
 
   if (shouldUseFileAPI) {
     return log_update_and_respond(
@@ -230,41 +209,45 @@ Deno.serve(async (req) => {
     );
   }
 
-  const { error: annotatingError } = await client
+  await client
     .from("messages")
     .update({ status: { annotating: new Date().toISOString() } })
-    .eq("id", incoming.id);
+    .eq("id", incoming.id)
+    .throwOnError();
 
-  if (annotatingError) {
-    throw annotatingError;
-  }
-
-  const file = await downloadFromStorage(client, message.file.uri);
+  const file = await downloadFromStorage(client, content.file.uri);
   const base64File = encodeBase64(await file.arrayBuffer());
 
   let prompt = "";
 
   switch (mediaType) {
     case "audio":
-      prompt = `Analyze this audio file. Provide a transcription of the audio content in its original language and a brief description in ${language} of what it contains (voice, music, noises, etc.). If it's voice, include emotion recognition in the description.`;
+      prompt =
+        `Analyze this audio file. Provide a transcription of the audio content in its original language and a brief description in ${language} of what it contains (voice, music, noises, etc.). If it's voice, include emotion recognition in the description.`;
       break;
     case "video":
-      prompt = `Analyze this video file. Provide a transcription of any audio content in its original language and a brief description in ${language} of what the video shows.`;
+      prompt =
+        `Analyze this video file. Provide a transcription of any audio content in its original language and a brief description in ${language} of what the video shows.`;
       break;
     case "image":
-      prompt = `Analyze this image. If it contains text, extract it as transcription in its original language using markdown format if possible. Provide a brief description in ${language} of the image content, or if it's a document, specify the document type (invoice, receipt, etc.) and include relevant information (dates, amounts, etc.).`;
+      prompt =
+        `Analyze this image. If it contains text, extract it as transcription in its original language using markdown format if possible. Provide a brief description in ${language} of the image content, or if it's a document, specify the document type (invoice, receipt, etc.) and include relevant information (dates, amounts, etc.).`;
       break;
     case "document":
       if (mimeType === "text/csv") {
-        prompt = `Analyze this CSV document. Do not transcribe! Do not extract the data as a table either! Provide a brief description in ${language} of the data (column names, row samples, etc.).`;
+        prompt =
+          `Analyze this CSV document. Do not transcribe! Do not extract the data as a table either! Provide a brief description in ${language} of the data (column names, row samples, etc.).`;
       } else if (mimeType === "application/pdf") {
-        prompt = `Analyze this PDF document. Extract the text content as transcription in its original language using markdown format if possible. If the content includes a table, do not transcribe the table. Instead, provide the table as an array of arrays; the first row should contain the column names (if the header is multi-row, flatten it and pick sensible column names). Do not treat key-value data as a table (avoid single-row tables). Provide a brief description in ${language} of the document, specify the document type (invoice, receipt, etc.) and include relevant information (dates, amounts, etc.).`;
+        prompt =
+          `Analyze this PDF document. Extract the text content as transcription in its original language using markdown format if possible. If the content includes a table, do not transcribe the table. Instead, provide the table as an array of arrays; the first row should contain the column names (if the header is multi-row, flatten it and pick sensible column names). Do not treat key-value data as a table (avoid single-row tables). Provide a brief description in ${language} of the document, specify the document type (invoice, receipt, etc.) and include relevant information (dates, amounts, etc.).`;
       } else {
-        prompt = `Analyze this text document. Do not transcribe! If the content includes a table, provide the table as an array of arrays; the first row should contain the column names (if the header is multi-row, flatten it and pick sensible column names). Do not treat key-value data as a table (avoid single-row tables). Provide a brief description in ${language} of the document, specify the document type (invoice, receipt, etc.) and include relevant information (dates, amounts, etc.).`;
+        prompt =
+          `Analyze this text document. Do not transcribe! If the content includes a table, provide the table as an array of arrays; the first row should contain the column names (if the header is multi-row, flatten it and pick sensible column names). Do not treat key-value data as a table (avoid single-row tables). Provide a brief description in ${language} of the document, specify the document type (invoice, receipt, etc.) and include relevant information (dates, amounts, etc.).`;
       }
       break;
     default:
-      prompt = `Analyze this file and provide a transcription of any text content in its original language and a brief description in ${language} of what it contains.`;
+      prompt =
+        `Analyze this file and provide a transcription of any text content in its original language and a brief description in ${language} of what it contains.`;
   }
 
   if (config?.extra_prompt) {
@@ -294,11 +277,11 @@ Deno.serve(async (req) => {
 
   const contents: Array<
     | {
-        text: string;
-      }
+      text: string;
+    }
     | {
-        inlineData: { mimeType: string; data: string };
-      }
+      inlineData: { mimeType: string; data: string };
+    }
   > = [
     {
       inlineData: {
@@ -356,7 +339,7 @@ Deno.serve(async (req) => {
 
   try {
     result = JSON.parse(response.text);
-  } catch (error) {
+  } catch (_error) {
     return log_update_and_respond(
       "error",
       "Failed to parse the response text from the annotation model into a JSON object. Skipping annotation.",
@@ -380,7 +363,7 @@ Deno.serve(async (req) => {
     result.transcription.length > MAX_SMALL_DOCUMENT_SIZE
   ) {
     // Store enriched documents (PDF) transcription as llm.txt
-    const name = [message.file.name, "llm.txt"].join(".");
+    const name = [content.file.name, "llm.txt"].join(".");
 
     const file = new Blob([result.transcription], {
       type: "text/markdown",
@@ -413,7 +396,7 @@ Deno.serve(async (req) => {
   if (result.table?.length && mimeType !== "text/csv") {
     const csv = stringify(result.table);
 
-    const name = [message.file.name, "csv"].join(".");
+    const name = [content.file.name, "csv"].join(".");
 
     const file = new Blob([csv], {
       type: "text/csv",
@@ -428,10 +411,10 @@ Deno.serve(async (req) => {
     });
   }
 
-  const annotated_v1 = {
-    ...row_v1,
-    message: {
-      ...message,
+  const annotated = {
+    ...incoming,
+    content: {
+      ...content,
       artifacts,
     },
     status: {
@@ -440,24 +423,11 @@ Deno.serve(async (req) => {
     },
   };
 
-  const annotated_v0 = fromV1(annotated_v1);
-
-  if (!annotated_v0) {
-    return log_update_and_respond(
-      "error",
-      "Failed to convert annotated message row from v1 to v0. Skipping annotation.",
-    );
-  }
-
-  const { error: annotatedError } = await client
+  await client
     .from("messages")
-    // @ts-expect-error it fears to update an incoming message as outgoing and viceversa
-    .update(annotated_v0)
-    .eq("id", incoming.id);
-
-  if (annotatedError) {
-    throw annotatedError;
-  }
+    .update(annotated)
+    .eq("id", incoming.id)
+    .throwOnError();
 
   return new Response();
 });
